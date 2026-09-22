@@ -75,6 +75,6 @@ export class SphericalProjector implements PanoramaProjector {
       }
     }
 
-    return { width: outWidth, height: outHeight, data, mask }
+    return { width: outWidth, height: outHeight, data, mask } as CylindricalImage
   }
 }

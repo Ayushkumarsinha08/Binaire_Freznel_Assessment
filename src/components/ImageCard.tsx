@@ -1,5 +1,5 @@
 import { ActionButton, Flex, Text, View } from '@adobe/react-spectrum'
-import { useEffect, useState } from 'react'
+import { useEffect, useState, type SyntheticEvent } from 'react'
 
 import type { ImageItem } from '../types'
 
@@ -31,6 +31,10 @@ export default function ImageCard({ image, index, onRemove }: ImageCardProps) {
     }
   }, [image.path])
 
+  const handleThumbnailError = (_event: SyntheticEvent<HTMLImageElement>) => {
+    setThumbnailFailed(true)
+  }
+
   return (
     <View UNSAFE_className="image-card">
       <div className="image-card-thumb-fallback">
@@ -39,7 +43,7 @@ export default function ImageCard({ image, index, onRemove }: ImageCardProps) {
             className="image-card-thumb"
             src={thumbnailUrl}
             alt={`${image.name} thumbnail`}
-            onError={() => setThumbnailFailed(true)}
+            onError={handleThumbnailError}
           />
         ) : (
           <span className="thumbnail-failure">{thumbnailFailed ? 'Preview unavailable' : 'Loading preview...'}</span>

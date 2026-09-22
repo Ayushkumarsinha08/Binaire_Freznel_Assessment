@@ -22,14 +22,6 @@ export class CylindricalProjector {
     const data = new Uint8Array(width * height * 4)
     const mask = new Uint8Array(width * height)
 
-    console.log({
-      sourceWidth: width,
-      sourceHeight: height,
-      projectedWidth: width,
-      projectedHeight: height,
-      focalLength,
-    })
-
     for (let destinationY = 0; destinationY < height; destinationY += 1) {
       for (let destinationX = 0; destinationX < width; destinationX += 1) {
         const theta = (destinationX - centerX) / focalLength

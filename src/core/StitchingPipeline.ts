@@ -2,7 +2,7 @@ import type { DecodedImage, ImageItem, PanoramaType } from '../types'
 import { CylindricalProjector, type CylindricalImage } from './CylindricalProjector'
 import { SphericalProjector, type PanoramaProjector } from './SphericalProjector'
 import { FeatureMatcher } from './FeatureMatcher'
-import { HomographyEstimator, transformPoint } from './Homography'
+
 
 type CvModule = any
 type CvMat = any
@@ -59,13 +59,7 @@ export class StitchingPipeline {
     this.loadImage = loadImage
   }
 
-  async stitch(images: ImageItem[], onProgress: StitchProgress): Promise<StitchResult> {
-    if (images.length < 2) {
-      throw new Error('Select at least two images to create a panorama.')
-    }
 
-    return this.stitchWithMode(images, onProgress, 'cylindrical')
-  }
 
   async stitchWithMode(
     images: ImageItem[],
@@ -120,14 +114,6 @@ export class StitchingPipeline {
           failureReason: displacement.failureReason,
         }
         diagnostics.push(diagnostic)
-        console.log({
-          pair: `${index} -> ${index + 1}`,
-          goodMatches: matchSet.matches.length,
-          translationInliers: displacement.translationInliers,
-          translationInlierRatio: displacement.translationInlierRatio,
-          dx: displacement.dx,
-          dy: displacement.dy,
-        })
         if (displacement.failureReason) {
           return { success: false, error: displacement.failureReason, diagnostics }
         }
@@ -142,13 +128,6 @@ export class StitchingPipeline {
       const canvasHeight = Math.ceil(bounds.maxY - bounds.minY)
       onProgress(80, 'Blending panorama...')
       const result = this.blendOriginalImages(originalMats, positions, bounds, canvasWidth, canvasHeight)
-      console.log({
-        imageCount: images.length,
-        canvasWidth,
-        canvasHeight,
-        outputWidth: result.width,
-        outputHeight: result.height,
-      })
 
       onProgress(100, 'Panorama ready')
       return { success: true, panorama: result, diagnostics }
@@ -302,112 +281,6 @@ export class StitchingPipeline {
     return { width: outputWidth, height: outputHeight, data: new Uint8ClampedArray(output) }
   }
 
-  async stitchHomography(images: ImageItem[], onProgress: StitchProgress): Promise<StitchResult> {
-
-    const originalMats: CvMat[] = []
-    const cumulativeTransforms: CvMat[] = []
-
-    try {
-      onProgress(0, 'Preparing images...')
-      for (const image of images) {
-        originalMats.push(await this.loadImageMat(image))
-      }
-
-      cumulativeTransforms.push(this.identityTransform())
-      const matcher = new FeatureMatcher(this.cv)
-      const estimator = new HomographyEstimator(this.cv)
-
-      for (let index = 1; index < originalMats.length; index += 1) {
-        const pairNumber = index
-        const progressBase = Math.round(((index - 1) / (images.length - 1)) * 55) + 20
-        onProgress(progressBase, 'Detecting features...')
-        const matchSet = matcher.findGoodMatches(originalMats[index - 1], originalMats[index])
-        onProgress(progressBase + 5, 'Matching features...')
-        console.debug(`Pair ${pairNumber}: Image${index} -> Image${index + 1} matching`, {
-          keypointsA: matchSet.keypointsImageOne,
-          keypointsB: matchSet.keypointsImageTwo,
-          rawMatches: matchSet.rawMatches,
-          goodMatches: matchSet.matches.length,
-          ratioMatches: matchSet.ratioMatches,
-          mutualMatches: matchSet.mutualMatches,
-        })
-        let estimate
-        try {
-          estimate = estimator.estimateFromMatches(matchSet.matches)
-        } catch (error) {
-          if (index === originalMats.length - 1) {
-            const reason = error instanceof Error ? error.message : 'unknown homography failure'
-            throw new Error(`Image ${index + 1} could not be reliably aligned with Image ${index}: ${reason}`)
-          }
-          throw error
-        }
-
-        console.debug(`Pair ${pairNumber}: Image${index} -> Image${index + 1}`, {
-          keypointsA: matchSet.keypointsImageOne,
-          keypointsB: matchSet.keypointsImageTwo,
-          rawMatches: matchSet.rawMatches,
-          goodMatches: matchSet.matches.length,
-          inliers: estimate.inliers,
-          inlierRatio: estimate.inlierRatio,
-          reprojectionError: estimate.reprojectionError,
-        })
-
-        const sample = matchSet.matches[0]
-        const directPoint = transformPoint(this.cv, sample.imageTwoPoint, estimate.matrix)
-        const composedTransform = this.multiply(cumulativeTransforms[index - 1], estimate.matrix)
-        let composedPoint
-        try {
-          composedPoint = transformPoint(this.cv, sample.imageTwoPoint, composedTransform)
-        } finally {
-          composedTransform.delete()
-        }
-        console.debug(`Pair ${pairNumber} direction check`, {
-          sourceImagePoint: sample.imageTwoPoint,
-          directImagePoint: directPoint,
-          expectedImagePoint: sample.imageOnePoint,
-          directError: Math.hypot(directPoint.x - sample.imageOnePoint.x, directPoint.y - sample.imageOnePoint.y),
-          composedImage1Point: composedPoint,
-        })
-
-        const cumulative = this.multiply(cumulativeTransforms[index - 1], estimate.matrix)
-        estimate.matrix.delete()
-        cumulativeTransforms.push(cumulative)
-      }
-
-      onProgress(60, 'Calculating transformation...')
-      this.logIntermediateBounds(originalMats, cumulativeTransforms)
-      const bounds = this.calculateGlobalBounds(originalMats, cumulativeTransforms)
-      console.debug('Global bounds:', bounds)
-
-      const width = Math.ceil(bounds.maxX - bounds.minX)
-      const height = Math.ceil(bounds.maxY - bounds.minY)
-      const largestInputDimension = Math.max(...originalMats.flatMap((mat) => [mat.cols, mat.rows]))
-      const maximumDimension = largestInputDimension * 8
-      if (width <= 0 || height <= 0 || width > maximumDimension || height > maximumDimension) {
-        throw new Error('The combined panorama bounds are invalid. Try images with more consistent overlap.')
-      }
-      console.debug('Final canvas:', { width, height })
-
-      onProgress(80, 'Warping images...')
-      const result = this.warpOriginalsToCommonCanvas(
-        originalMats,
-        cumulativeTransforms,
-        bounds.minX,
-        bounds.minY,
-        width,
-        height,
-      )
-      onProgress(100, 'Panorama ready')
-      return { success: true, panorama: result, diagnostics: [] }
-    } finally {
-      for (const mat of originalMats) {
-        mat.delete()
-      }
-      for (const transform of cumulativeTransforms) {
-        transform.delete()
-      }
-    }
-  }
 
   async stitchCylindrical(
     images: ImageItem[],
@@ -437,7 +310,7 @@ export class StitchingPipeline {
       }
 
       const matcher = new FeatureMatcher(this.cv)
-      console.log({ imageIndex: 1, dx: 0, dy: 0, positionX: 0, positionY: 0 })
+
       for (let index = 1; index < projectedMats.length; index += 1) {
         onProgress(Math.round((index / images.length) * 60), 'Detecting features...')
         let matchSet
@@ -465,7 +338,6 @@ export class StitchingPipeline {
             failureReason: reason,
           }
           diagnostics.push(diagnostic)
-          this.logCylindricalDiagnostic(diagnostic, [])
           return { success: false, error: reason, diagnostics }
         }
         const displacement = this.estimateCylindricalDisplacement(
@@ -492,7 +364,6 @@ export class StitchingPipeline {
           failureReason: displacement.failureReason,
         }
         diagnostics.push(diagnostic)
-        this.logCylindricalDiagnostic(diagnostic, displacement.sampleDeltas)
         if (displacement.failureReason) {
           return {
             success: false,
@@ -504,30 +375,14 @@ export class StitchingPipeline {
           x: positions[index - 1].x - displacement.x,
           y: positions[index - 1].y - displacement.y,
         })
-        console.log({
-          imageIndex: index + 1,
-          dx: displacement.x,
-          dy: displacement.y,
-          positionX: positions[index].x,
-          positionY: positions[index].y,
-        })
       }
 
       onProgress(75, 'Calculating transformation...')
       const bounds = this.calculateCylindricalBounds(projectedImages, positions)
-      console.log('CYLINDRICAL POSITIONS', positions)
-      const rectangles = projectedImages.map((image, index) => ({
-        image: index + 1,
-        left: positions[index].x,
-        right: positions[index].x + image.width,
-        top: positions[index].y,
-        bottom: positions[index].y + image.height,
-      }))
-      rectangles.forEach((rectangle) => console.log(rectangle))
-      for (let index = 1; index < rectangles.length; index += 1) {
-        const previous = rectangles[index - 1]
-        const current = rectangles[index]
-        if (Math.min(previous.right, current.right) <= Math.max(previous.left, current.left)) {
+      for (let index = 1; index < projectedImages.length; index += 1) {
+        const prevRight = positions[index - 1].x + projectedImages[index - 1].width
+        const currLeft = positions[index].x
+        if (Math.min(prevRight, positions[index].x + projectedImages[index].width) <= Math.max(positions[index - 1].x, currLeft)) {
           return {
             success: false,
             error: `Cylindrical images ${index} and ${index + 1} do not overlap after translation.`,
@@ -535,25 +390,14 @@ export class StitchingPipeline {
           }
         }
       }
-      console.debug('Cylindrical global bounds:', bounds)
       const width = Math.ceil(bounds.maxX - bounds.minX)
       const height = Math.ceil(bounds.maxY - bounds.minY)
-      console.debug('Cylindrical final canvas:', { width, height })
 
       if (width <= 0 || height <= 0 || width > 50000 || height > 10000) {
         throw new Error('The cylindrical panorama bounds are invalid. Try images with more horizontal overlap.')
       }
 
       onProgress(85, 'Warping images...')
-      const columnsWithNoCoverage = this.countUncoveredColumns(projectedImages, positions, bounds, width, height)
-      console.log({
-        minX: bounds.minX,
-        maxX: bounds.maxX,
-        columnsWithNoCoverage,
-        imagePositions: positions,
-        canvasWidth: width,
-        canvasHeight: height,
-      })
       const result = this.blendCylindricalImages(projectedImages, positions, bounds, width, height)
       onProgress(100, 'Panorama ready')
       return { success: true, panorama: result, diagnostics }
@@ -575,7 +419,6 @@ export class StitchingPipeline {
       y: match.imageTwoPoint.y - match.imageOnePoint.y,
     }))
     let bestConsensus: typeof displacements = []
-    let bestCandidate = displacements[0] ?? { x: 0, y: 0 }
 
     for (let iteration = 0; iteration < ransacIterations && displacements.length > 0; iteration += 1) {
       const candidate = displacements[Math.floor(Math.random() * displacements.length)]
@@ -584,7 +427,6 @@ export class StitchingPipeline {
       ))
       if (consensus.length > bestConsensus.length) {
         bestConsensus = consensus
-        bestCandidate = candidate
       }
     }
 
@@ -607,17 +449,7 @@ export class StitchingPipeline {
       residuals.reduce((sum, residual) => sum + residual.x ** 2 + residual.y ** 2, 0) / residuals.length,
     )
 
-    console.debug('Cylindrical displacement consensus', {
-      candidate: bestCandidate,
-      threshold: translationRansacThreshold,
-      translationInliers: inlierCount,
-      totalMatches: matches.length,
-      dx,
-      dy,
-      dxStandardDeviation,
-      dyStandardDeviation,
-      alignmentResidual,
-    })
+
 
     return {
       x: dx,
@@ -629,7 +461,6 @@ export class StitchingPipeline {
       dxStandardDeviation,
       dyStandardDeviation,
       alignmentResidual,
-      sampleDeltas: translationInliers.slice(0, 10),
       failureReason: inlierCount < 20
         ? 'Adjacent images have an unreasonable cylindrical displacement.'
         : Math.abs(dy) > verticalLimit
@@ -640,29 +471,6 @@ export class StitchingPipeline {
               ? 'Adjacent images have excessive cylindrical alignment residual.'
               : undefined,
     }
-  }
-
-  private logCylindricalDiagnostic(
-    diagnostic: CylindricalDiagnostic,
-    samples: Array<{ x: number; y: number }>,
-  ) {
-    console.group(`Cylindrical Pair ${diagnostic.pairIndex}`)
-    console.log('keypointsA', diagnostic.keypointsA)
-    console.log('keypointsB', diagnostic.keypointsB)
-    console.log('rawMatches', diagnostic.rawMatches)
-    console.log('goodMatches', diagnostic.goodMatches)
-    console.log('ratioMatches', diagnostic.ratioMatches)
-    console.log('mutualMatches', diagnostic.mutualMatches)
-    console.log('translationInliers', diagnostic.translationInliers)
-    console.log('translationInlierRatio', diagnostic.translationInlierRatio)
-    console.log('medianDx', diagnostic.medianDx)
-    console.log('medianDy', diagnostic.medianDy)
-    console.log('dxStandardDeviation', diagnostic.dxStandardDeviation)
-    console.log('dyStandardDeviation', diagnostic.dyStandardDeviation)
-    console.log('alignmentResidual', diagnostic.alignmentResidual)
-    console.log('failureReason', diagnostic.failureReason)
-    samples.forEach((sample, index) => console.log(`match ${index + 1}: dx=${sample.x}, dy=${sample.y}`))
-    console.groupEnd()
   }
 
   private standardDeviation(values: number[], mean: number) {
@@ -676,34 +484,6 @@ export class StitchingPipeline {
       minY: Math.min(bounds.minY, positions[index].y),
       maxY: Math.max(bounds.maxY, positions[index].y + image.height),
     }), { minX: 0, maxX: 0, minY: 0, maxY: 0 })
-  }
-
-  private countUncoveredColumns(
-    images: CylindricalImage[],
-    positions: Array<{ x: number; y: number }>,
-    bounds: Bounds,
-    width: number,
-    height: number,
-  ) {
-    const coverage = new Uint32Array(width)
-    const offsetX = Math.floor(-bounds.minX)
-    const offsetY = Math.floor(-bounds.minY)
-
-    images.forEach((image, imageIndex) => {
-      const startX = Math.round(positions[imageIndex].x + offsetX)
-      const startY = Math.round(positions[imageIndex].y + offsetY)
-      for (let y = 0; y < image.height; y += 1) {
-        const destinationY = startY + y
-        if (destinationY < 0 || destinationY >= height) continue
-        for (let x = 0; x < image.width; x += 1) {
-          if (image.mask[y * image.width + x] === 0) continue
-          const destinationX = startX + x
-          if (destinationX >= 0 && destinationX < width) coverage[destinationX] += 1
-        }
-      }
-    })
-
-    return Array.from(coverage).filter((count) => count === 0).length
   }
 
   private blendCylindricalImages(
@@ -722,37 +502,6 @@ export class StitchingPipeline {
       const startX = Math.round(positions[imageIndex].x + offsetX)
       const startY = Math.round(positions[imageIndex].y + offsetY)
       const featherWeights = this.createMaskFeatherWeights(image.mask, image.width, image.height)
-      let validPixels = 0
-      let maskMinX = image.width
-      let maskMinY = image.height
-      let maskMaxX = -1
-      let maskMaxY = -1
-      for (let maskY = 0; maskY < image.height; maskY += 1) {
-        for (let maskX = 0; maskX < image.width; maskX += 1) {
-          if (image.mask[maskY * image.width + maskX] === 0) continue
-          validPixels += 1
-          maskMinX = Math.min(maskMinX, maskX)
-          maskMinY = Math.min(maskMinY, maskY)
-          maskMaxX = Math.max(maskMaxX, maskX)
-          maskMaxY = Math.max(maskMaxY, maskY)
-        }
-      }
-      console.log({
-        imageIndex: imageIndex + 1,
-        projectedWidth: image.width,
-        projectedHeight: image.height,
-        validPixels,
-        validPercentage: validPixels / (image.width * image.height),
-        translatedMaskBounds: {
-          x: maskMaxX >= 0 ? maskMinX + startX : -1,
-          y: maskMaxY >= 0 ? maskMinY + startY : -1,
-          width: maskMaxX >= 0 ? maskMaxX - maskMinX + 1 : 0,
-          height: maskMaxY >= 0 ? maskMaxY - maskMinY + 1 : 0,
-        },
-      })
-      if (validPixels === 0) {
-        console.warn(`Cylindrical image ${imageIndex + 1} has no valid projected pixels.`)
-      }
       for (let sourceY = 0; sourceY < image.height; sourceY += 1) {
         for (let sourceX = 0; sourceX < image.width; sourceX += 1) {
           if (image.mask[sourceY * image.width + sourceX] === 0) {
@@ -783,13 +532,11 @@ export class StitchingPipeline {
 
     const rowCoverage = new Uint32Array(height)
     const columnCoverage = new Uint32Array(width)
-    let validPixelCount = 0
     for (let y = 0; y < height; y += 1) {
       for (let x = 0; x < width; x += 1) {
         if (weights[y * width + x] <= 0.0001) {
           continue
         }
-        validPixelCount += 1
         rowCoverage[y] += 1
         columnCoverage[x] += 1
       }
@@ -808,18 +555,6 @@ export class StitchingPipeline {
 
     const croppedWidth = validMaxX - validMinX + 1
     const croppedHeight = validMaxY - validMinY + 1
-    const cropRect = {
-      x: validMinX,
-      y: validMinY,
-      width: croppedWidth,
-      height: croppedHeight,
-    }
-    console.log({
-      panoramaWidth: width,
-      panoramaHeight: height,
-      validPixelPercentage: (validPixelCount / (width * height)) * 100,
-      cropRect,
-    })
     const croppedData = new Uint8Array(croppedWidth * croppedHeight * 4)
     for (let y = 0; y < croppedHeight; y += 1) {
       for (let x = 0; x < croppedWidth; x += 1) {
@@ -836,24 +571,6 @@ export class StitchingPipeline {
         croppedData[destinationIndex + 3] = 255
       }
     }
-
-    console.debug('Cylindrical valid bounding box:', {
-      minX: validMinX,
-      minY: validMinY,
-      maxX: validMaxX,
-      maxY: validMaxY,
-      width: croppedWidth,
-      height: croppedHeight,
-    })
-
-    console.log({
-      finalWidth: croppedWidth,
-      finalHeight: croppedHeight,
-      outputWidth: croppedWidth,
-      outputHeight: croppedHeight,
-      validPercentage: (validPixelCount / (width * height)) * 100,
-      cropRect,
-    })
 
     return { width: croppedWidth, height: croppedHeight, data: new Uint8ClampedArray(croppedData) }
   }
@@ -951,222 +668,4 @@ export class StitchingPipeline {
     )
     return this.cv.matFromImageData(imageData)
   }
-
-  private identityTransform(): CvMat {
-    const identity = new this.cv.Mat(3, 3, this.cv.CV_64F)
-    identity.data64F.set([
-      1, 0, 0,
-      0, 1, 0,
-      0, 0, 1,
-    ])
-    return identity
-  }
-
-  private multiply(left: CvMat, right: CvMat): CvMat {
-    const result = new this.cv.Mat()
-    const empty = new this.cv.Mat()
-
-    try {
-      this.cv.gemm(left, right, 1, empty, 0, result)
-      return result
-    } catch (error) {
-      result.delete()
-      throw error
-    } finally {
-      empty.delete()
-    }
-  }
-
-  private calculateGlobalBounds(originalMats: CvMat[], transforms: CvMat[]): Bounds {
-    let minX = 0
-    let minY = 0
-    let maxX = 0
-    let maxY = 0
-
-    originalMats.forEach((image, index) => {
-      const corners = this.transformCorners(image, transforms[index])
-      console.debug(`H${index + 1} transformed corners`, corners)
-      this.validateTransformedCorners(image, corners, index)
-
-      for (const corner of corners) {
-        if (!Number.isFinite(corner.x) || !Number.isFinite(corner.y)) {
-          throw new Error('A transformed image has invalid bounds. Try images with more consistent overlap.')
-        }
-
-        minX = Math.min(minX, corner.x)
-        minY = Math.min(minY, corner.y)
-        maxX = Math.max(maxX, corner.x)
-        maxY = Math.max(maxY, corner.y)
-      }
-    })
-
-    return { minX, maxX, minY, maxY }
-  }
-
-  private validateTransformedCorners(image: CvMat, corners: Point[], index: number) {
-    const area = Math.abs(corners.reduce((sum, point, pointIndex) => {
-      const next = corners[(pointIndex + 1) % corners.length]
-      return sum + point.x * next.y - next.x * point.y
-    }, 0) / 2)
-    const sourceArea = image.cols * image.rows
-    const areaRatio = area / sourceArea
-    const edgeLengths = corners.map((point, pointIndex) => {
-      const next = corners[(pointIndex + 1) % corners.length]
-      return Math.hypot(next.x - point.x, next.y - point.y)
-    })
-    const shortestEdge = Math.min(...edgeLengths)
-    const longestEdge = Math.max(...edgeLengths)
-
-    if (
-      areaRatio < 0.05 ||
-      areaRatio > 20 ||
-      shortestEdge <= 1 ||
-      longestEdge / shortestEdge > 8
-    ) {
-      throw new Error(`Image ${index + 1} could not be reliably aligned with its adjacent image.`)
-    }
-  }
-
-  private logIntermediateBounds(originalMats: CvMat[], transforms: CvMat[]) {
-    for (let endIndex = 1; endIndex < originalMats.length; endIndex += 1) {
-      const bounds = this.calculateGlobalBounds(
-        originalMats.slice(0, endIndex + 1),
-        transforms.slice(0, endIndex + 1),
-      )
-      console.debug(`panorama_1_${Array.from({ length: endIndex }, (_, index) => index + 2).join('_')} dimensions`, {
-        width: Math.ceil(bounds.maxX - bounds.minX),
-        height: Math.ceil(bounds.maxY - bounds.minY),
-        bounds,
-      })
-    }
-  }
-
-  private transformCorners(image: CvMat, transform: CvMat): Point[] {
-    const corners = new this.cv.Mat(4, 1, this.cv.CV_32FC2)
-    const transformed = new this.cv.Mat()
-
-    try {
-      corners.data32F.set([
-        0, 0,
-        image.cols, 0,
-        image.cols, image.rows,
-        0, image.rows,
-      ])
-      this.cv.perspectiveTransform(corners, transformed, transform)
-
-      const points: Point[] = []
-      for (let index = 0; index < 4; index += 1) {
-        points.push({
-          x: transformed.data32F[index * 2],
-          y: transformed.data32F[index * 2 + 1],
-        })
-      }
-      return points
-    } finally {
-      corners.delete()
-      transformed.delete()
-    }
-  }
-
-  private warpOriginalsToCommonCanvas(
-    originalMats: CvMat[],
-    transforms: CvMat[],
-    minX: number,
-    minY: number,
-    width: number,
-    height: number,
-  ): PanoramaResult {
-    const translation = new this.cv.Mat(3, 3, this.cv.CV_64F)
-    const panorama = new this.cv.Mat(height, width, this.cv.CV_8UC4)
-    const empty = new this.cv.Mat()
-    const zero = new this.cv.Scalar(0, 0, 0, 0)
-    const weights = new Float32Array(width * height)
-
-    try {
-      translation.data64F.set([
-        1, 0, -minX,
-        0, 1, -minY,
-        0, 0, 1,
-      ])
-      panorama.setTo(zero)
-
-      originalMats.forEach((image, index) => {
-        const finalTransform = new this.cv.Mat()
-        const warped = new this.cv.Mat()
-        const sourceMask = new this.cv.Mat(image.rows, image.cols, this.cv.CV_8UC1)
-        const warpedMask = new this.cv.Mat()
-        const feather = new this.cv.Mat()
-        const size = new this.cv.Size(width, height)
-
-        try {
-          this.cv.gemm(translation, transforms[index], 1, empty, 0, finalTransform)
-          sourceMask.setTo(new this.cv.Scalar(255))
-          this.cv.warpPerspective(
-            image,
-            warped,
-            finalTransform,
-            size,
-            this.cv.INTER_LINEAR,
-            this.cv.BORDER_CONSTANT,
-            zero,
-          )
-          this.cv.warpPerspective(
-            sourceMask,
-            warpedMask,
-            finalTransform,
-            size,
-            this.cv.INTER_NEAREST,
-            this.cv.BORDER_CONSTANT,
-            new this.cv.Scalar(0),
-          )
-          this.cv.distanceTransform(warpedMask, feather, this.cv.DIST_L2, 3)
-          this.blendPixels(panorama, warped, warpedMask, feather, weights)
-        } finally {
-          finalTransform.delete()
-          warped.delete()
-          sourceMask.delete()
-          warpedMask.delete()
-          feather.delete()
-        }
-      })
-
-      return {
-        width,
-        height,
-        data: new Uint8ClampedArray(panorama.data),
-      }
-    } finally {
-      translation.delete()
-      panorama.delete()
-      empty.delete()
-    }
-  }
-
-  private blendPixels(
-    panorama: CvMat,
-    warped: CvMat,
-    mask: CvMat,
-    feather: CvMat,
-    weights: Float32Array,
-  ) {
-    const output = panorama.data as Uint8Array
-    const overlay = warped.data as Uint8Array
-    const validPixels = mask.data as Uint8Array
-    const featherWeights = feather.data32F as Float32Array
-
-    for (let pixelIndex = 0, index = 0; index < output.length; pixelIndex += 1, index += 4) {
-      if (validPixels[pixelIndex] === 0 || overlay[index + 3] === 0) {
-        continue
-      }
-
-      const incomingWeight = Math.max(1, featherWeights[pixelIndex])
-      const existingWeight = weights[pixelIndex]
-      const totalWeight = existingWeight + incomingWeight
-      output[index] = Math.round((output[index] * existingWeight + overlay[index] * incomingWeight) / totalWeight)
-      output[index + 1] = Math.round((output[index + 1] * existingWeight + overlay[index + 1] * incomingWeight) / totalWeight)
-      output[index + 2] = Math.round((output[index + 2] * existingWeight + overlay[index + 2] * incomingWeight) / totalWeight)
-      output[index + 3] = 255
-      weights[pixelIndex] = totalWeight
-    }
-  }
-}
+}
